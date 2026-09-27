@@ -55,22 +55,29 @@ class Player(wavelink.Player):
 
 
 # ==================== AVATAR DECORATION FETCH ====================
+# Cache stores (png_url_or_None, fetched_at)
 _decoration_cache: dict[int, tuple[str | None, float]] = {}
 _DECORATION_TTL = 60 * 60 * 12  # 12 hours
 
 
 def _build_decoration_url(asset: str) -> str:
-    """Build the full Discord CDN URL for an avatar decoration asset.
+    """Build the FULL Discord CDN URL for an avatar decoration asset.
 
-    Animated decorations have assets prefixed with `a_` and must use `.gif`.
-    Static decorations use `.png`.
+    Discord's decoration asset hashes do NOT use the `a_` animated prefix
+    convention (that's for avatars/banners). We always serve the `.png`
+    variant of the decoration, regardless of whether it is animated.
     """
-    ext = "gif" if asset.startswith("a_") else "png"
-    return f"https://cdn.discordapp.com/avatar-decoration-presets/{asset}.{ext}?size=240"
+    asset = str(asset).strip()
+    # Strip any extension the caller may have accidentally included.
+    for ext in (".png", ".gif", ".webp"):
+        if asset.lower().endswith(ext):
+            asset = asset[: -len(ext)]
+            break
+    return f"https://cdn.discordapp.com/avatar-decoration-presets/{asset}.png?size=240"
 
 
 async def get_avatar_decoration(user_id: int) -> str | None:
-    """Return the FULL CDN URL for a user's avatar decoration, or None.
+    """Return the FULL CDN URL (.png) for a user's avatar decoration, or None.
 
     Returns None if the user has no decoration, if the fetch fails, or if the
     API returns a non-200 status. Cached for 12h.
@@ -928,7 +935,7 @@ async def update_member_presence(member):
             "username": member.name,
             "global_name": member.global_name,
             "avatar": str(member.avatar.url) if member.avatar else None,
-            "avatar_decoration": decoration,  # full CDN URL or None
+            "avatar_decoration": decoration,  # full CDN URL (.png) or None
             "status": status,
             "custom_status": custom_status,
             "activities": activities,
@@ -1150,7 +1157,7 @@ if __name__ == "__main__":
     print("=" * 50)
     print("🚀 Starting bot (Lavalink mode)...")
     print("📡 Member tracking: Enabled (auto-sync every 5 minutes, all guilds)")
-    print("✨ Avatar decorations: ENABLED (full CDN URL, 12h cache)")
+    print("✨ Avatar decorations: ENABLED (always .png, 12h cache)")
     print(f"🔴 TikTok/Kick live tracking: Enabled (every {LIVE_CHECK_INTERVAL_SECONDS}s)")
     print("🎵 Spotify: handled natively by LavaSrc via Lavalink")
     print("=" * 50)
