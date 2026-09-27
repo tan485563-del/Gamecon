@@ -1,0 +1,21 @@
+# ==================== CORE ====================
+discord.py>=2.4.0
+aiohttp>=3.9.0
+
+# ==================== MUSIC (LAVALINK) ====================
+wavelink>=3.0.0
+
+# ==================== SPOTIFY METADATA ====================
+spotipy>=2.23.0
+
+# ==================== TIKTOK LIVE ====================
+TikTokLive>=6.0.0
+
+# ==================== OPTIONAL / TRANSITIVE ====================
+# TikTokLive pulls in these, but pinning them avoids resolver surprises:
+protobuf>=4.25.0
+betterproto>=2.0.0b6
+
+# ==================== PRODUCTION / RUNTIME ====================
+# (uncomment if you deploy on Railway/Heroku-style hosts)
+# gunicorn>=21.2.0
