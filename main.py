@@ -159,13 +159,19 @@ async def on_wavelink_track_start(payload: wavelink.TrackStartEventPayload):
     if getattr(track.extras, "is_fallback", False) if track.extras else False:
         embed.set_footer(text="⚠️ Played via SoundCloud fallback")
 
-    await player.home.send(embed=embed)
+    try:
+        await player.home.send(embed=embed)
+    except Exception as e:
+        logger.error(f"Failed to send now-playing embed: {e}")
 
 
 @bot.event
 async def on_wavelink_inactive_player(player: Player):
     if player.home:
-        await player.home.send("📭 Queue is empty — leaving the voice channel due to inactivity.")
+        try:
+            await player.home.send("📭 Queue is empty — leaving the voice channel due to inactivity.")
+        except Exception as e:
+            logger.error(f"Failed to send inactive message: {e}")
     await player.disconnect()
 
 
@@ -194,6 +200,16 @@ async def _search_fallback(track: wavelink.Playable):
     return result.tracks[0] if isinstance(result, wavelink.Playlist) else result[0]
 
 
+def _safe_send_text(reason: str, limit: int = 1800) -> str:
+    """Trim a potentially huge error string so it fits Discord's 2000-char limit."""
+    if not reason:
+        return "Unknown error"
+    reason = str(reason)
+    if len(reason) <= limit:
+        return reason
+    return reason[:limit] + "\n…(truncated)"
+
+
 @bot.event
 async def on_wavelink_track_exception(payload: wavelink.TrackExceptionEventPayload):
     player: Player = payload.player  # type: ignore
@@ -211,9 +227,12 @@ async def on_wavelink_track_exception(payload: wavelink.TrackExceptionEventPaylo
             old_extras = track.extras.__dict__ if track.extras else {}
             fallback_track.extras = {**old_extras, "is_fallback": True}
             if player.home:
-                await player.home.send(
-                    f"⚠️ YouTube blocked **{track.title}** — found it on SoundCloud instead."
-                )
+                try:
+                    await player.home.send(
+                        f"⚠️ YouTube blocked **{track.title}** — found it on SoundCloud instead."
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to send fallback notice: {e}")
             try:
                 await player.play(fallback_track)
             except Exception as e:
@@ -221,16 +240,32 @@ async def on_wavelink_track_exception(payload: wavelink.TrackExceptionEventPaylo
             return
         else:
             if player.home:
-                await player.home.send(
-                    f"❌ Couldn't play **{track.title}** — no SoundCloud match found."
-                )
+                try:
+                    await player.home.send(
+                        f"❌ Couldn't play **{track.title}** — no SoundCloud match found."
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to send failure notice: {e}")
     else:
-        reason = payload.exception.get("message", "Unknown error") if payload.exception else "Unknown error"
+        # ---- CRITICAL FIX: log full error, send truncated version ----
+        reason_raw = payload.exception.get("message", "Unknown error") if payload.exception else "Unknown error"
+        logger.error(f"Playback failed for '{track.title}': {reason_raw}")
+
         if player.home:
-            await player.home.send(f"❌ Playback failed for **{track.title}**: {reason}")
+            try:
+                await player.home.send(
+                    f"❌ Playback failed for **{track.title}**:\n"
+                    f"```{_safe_send_text(reason_raw)}```"
+                )
+            except Exception as e:
+                # Never let error-reporting crash the bot
+                logger.error(f"Failed to send exception message: {e}")
 
     if not player.playing and not player.queue.is_empty:
-        await player.play(player.queue.get())
+        try:
+            await player.play(player.queue.get())
+        except Exception as e:
+            logger.error(f"Failed to play next track after exception: {e}")
 
 
 # ==================== VOICE CONNECTION ====================
@@ -276,9 +311,8 @@ def is_url(text: str) -> bool:
 
 
 async def search_playable(text: str) -> wavelink.Search:
-    """Search Lavalink. URLs (including Spotify, YouTube, SoundCloud, etc.)
-    are passed straight through to Lavalink, which lets LavaSrc resolve
-    Spotify links natively via its spotify source."""
+    """Search Lavalink. URLs (including Spotify, YouTube, SoundCloud) go straight
+    through to Lavalink so LavaSrc can resolve Spotify natively."""
     if is_url(text):
         return await wavelink.Playable.search(text)
     return await wavelink.Playable.search(text, source=_DEFAULT_SOURCE)
@@ -286,8 +320,7 @@ async def search_playable(text: str) -> wavelink.Search:
 
 @bot.command(name="play", aliases=["p"])
 async def play(ctx, *, query):
-    """Play a song. Accepts plain text searches, YouTube URLs, SoundCloud URLs,
-    Spotify track/album/playlist URLs (resolved by LavaSrc), and more."""
+    """Play a song. Accepts plain text, YouTube, SoundCloud, Spotify URLs, etc."""
     player, error = await connect_voice(ctx)
     if error:
         await ctx.send(error)
@@ -303,11 +336,10 @@ async def play(ctx, *, query):
         return
 
     if not result:
-        # Give a more specific hint if the user tried a Spotify link
         if "spotify.com" in query:
             await ctx.send(
                 "❌ Couldn't resolve that Spotify link. Make sure `SPOTIFY_CLIENT_ID` and "
-                "`SPOTIFY_CLIENT_SECRET` are set on the **Lavalink** service and that LavaSrc is loaded."
+                "`SPOTIFY_CLIENT_SECRET` are set on the **Lavalink** service and LavaSrc is loaded."
             )
         else:
             await ctx.send("❌ No results found!")
@@ -796,7 +828,7 @@ async def set_live_channel(ctx, channel: discord.TextChannel):
 @bot.command(name="setliverole")
 @commands.has_permissions(administrator=True)
 async def set_live_role(ctx, role: discord.Role = None):
-    """Admin: set a role to ping on live announcements (omit role to clear, falls back to @here)."""
+    """Admin: set a role to ping on live announcements."""
     if role:
         live_data["guild_roles"][str(ctx.guild.id)] = role.id
         save_live_data()
@@ -820,7 +852,7 @@ async def live_channel_info(ctx):
 @bot.command(name="checklive")
 @commands.has_permissions(administrator=True)
 async def force_check_live(ctx):
-    """Admin: force an immediate live-status check instead of waiting for the next cycle."""
+    """Admin: force an immediate live-status check."""
     await ctx.send("🔄 Checking live status for all linked accounts...")
     await check_live_streams()
     await ctx.send("✅ Done!")
@@ -1086,7 +1118,10 @@ async def on_command_error(ctx, error):
         await ctx.send(f"❌ Invalid argument: {error}")
     else:
         logger.error(f"Command error: {error}")
-        await ctx.send(f"❌ An error occurred: {str(error)}")
+        try:
+            await ctx.send(f"❌ An error occurred: {str(error)[:1500]}")
+        except Exception:
+            pass
 
 
 # ==================== RUN THE BOT ====================
