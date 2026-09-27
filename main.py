@@ -15,9 +15,6 @@ logger = logging.getLogger('discord')
 logger.setLevel(logging.INFO)
 
 # ==================== CONFIGURATION ====================
-# No GUILD_ID — the bot works on every server it's invited to. Anything
-# that used to assume "the one server" (live-announce channel) is
-# configured per-server via admin commands, persisted in guild_config.json.
 TOKEN = os.environ.get('DISCORD_BOT_TOKEN')
 API_ENDPOINT = os.environ.get('API_ENDPOINT', 'https://captkira.vercel.app/api/presence')
 API_SECRET = os.environ.get('API_SECRET', 'Bisaya-Presence-2024-SecretKey!')
@@ -27,10 +24,6 @@ LAVALINK_HOST = os.environ.get('LAVALINK_HOST', '')
 LAVALINK_PORT = os.environ.get('LAVALINK_PORT', '443')
 LAVALINK_PASSWORD = os.environ.get('LAVALINK_PASSWORD', '')
 LAVALINK_SSL = os.environ.get('LAVALINK_SSL', 'true').lower() in ('1', 'true', 'yes')
-
-# Spotify API (metadata resolution only)
-SPOTIFY_CLIENT_ID = os.environ.get('SPOTIFY_CLIENT_ID', '')
-SPOTIFY_CLIENT_SECRET = os.environ.get('SPOTIFY_CLIENT_SECRET', '')
 
 # TikTok / Kick live notifications
 DATA_DIR = os.environ.get('DATA_DIR', '.')
@@ -163,10 +156,6 @@ async def on_wavelink_track_start(payload: wavelink.TrackStartEventPayload):
     if requester:
         embed.add_field(name="Requested By", value=requester, inline=True)
 
-    spotify_artist = getattr(track.extras, "spotify_artist", None) if track.extras else None
-    if spotify_artist:
-        embed.add_field(name="🎵 Spotify Artist", value=spotify_artist, inline=True)
-
     if getattr(track.extras, "is_fallback", False) if track.extras else False:
         embed.set_footer(text="⚠️ Played via SoundCloud fallback")
 
@@ -270,72 +259,6 @@ async def connect_voice(ctx) -> tuple[Player | None, str | None]:
         return None, f"❌ Failed to connect: {str(e)}"
 
 
-# ==================== SPOTIFY METADATA RESOLUTION ====================
-
-SPOTIFY_PLAYLIST_TRACK_LIMIT = 100
-
-
-async def resolve_spotify_tracks(query):
-    if not SPOTIFY_CLIENT_ID or not SPOTIFY_CLIENT_SECRET:
-        return None
-    try:
-        import spotipy
-        from spotipy.oauth2 import SpotifyClientCredentials
-
-        sp = spotipy.Spotify(auth_manager=SpotifyClientCredentials(
-            client_id=SPOTIFY_CLIENT_ID,
-            client_secret=SPOTIFY_CLIENT_SECRET
-        ))
-
-        if "track" in query:
-            track_id = query.split("track/")[1].split("?")[0]
-            result = sp.track(track_id)
-            artist = result['artists'][0]['name']
-            return [(f"{result['name']} {artist}", artist)]
-
-        if "playlist" in query:
-            playlist_id = query.split("playlist/")[1].split("?")[0]
-            tracks = []
-            try:
-                results = sp.playlist_items(playlist_id, additional_types=["track"])
-            except Exception as e:
-                logger.error(f"Spotify playlist access error: {e}")
-                return "AUTH_REQUIRED"
-            while results:
-                for item in results.get('items', []):
-                    t = item.get('track')
-                    if t and t.get('name') and t.get('artists'):
-                        artist = t['artists'][0]['name']
-                        tracks.append((f"{t['name']} {artist}", artist))
-                        if len(tracks) >= SPOTIFY_PLAYLIST_TRACK_LIMIT:
-                            return tracks
-                results = sp.next(results) if results.get('next') else None
-            return tracks or None
-
-        if "album" in query:
-            album_id = query.split("album/")[1].split("?")[0]
-            tracks = []
-            try:
-                results = sp.album_tracks(album_id)
-            except Exception as e:
-                logger.error(f"Spotify album access error: {e}")
-                return "AUTH_REQUIRED"
-            while results:
-                for t in results.get('items', []):
-                    if t.get('name') and t.get('artists'):
-                        artist = t['artists'][0]['name']
-                        tracks.append((f"{t['name']} {artist}", artist))
-                        if len(tracks) >= SPOTIFY_PLAYLIST_TRACK_LIMIT:
-                            return tracks
-                results = sp.next(results) if results.get('next') else None
-            return tracks or None
-
-        return None
-    except Exception as e:
-        logger.error(f"Spotify resolve error: {e}")
-        return None
-
-
 # ==================== MUSIC COMMANDS ====================
 
 DEFAULT_SEARCH_SOURCE = os.environ.get('DEFAULT_SEARCH_SOURCE', 'soundcloud')
@@ -348,15 +271,23 @@ _SOURCE_MAP = {
 _DEFAULT_SOURCE = _SOURCE_MAP.get(DEFAULT_SEARCH_SOURCE, wavelink.TrackSource.SoundCloud)
 
 
+def is_url(text: str) -> bool:
+    return text.startswith("http://") or text.startswith("https://")
+
+
 async def search_playable(text: str) -> wavelink.Search:
-    if text.startswith("http://") or text.startswith("https://"):
+    """Search Lavalink. URLs (including Spotify, YouTube, SoundCloud, etc.)
+    are passed straight through to Lavalink, which lets LavaSrc resolve
+    Spotify links natively via its spotify source."""
+    if is_url(text):
         return await wavelink.Playable.search(text)
     return await wavelink.Playable.search(text, source=_DEFAULT_SOURCE)
 
 
 @bot.command(name="play", aliases=["p"])
 async def play(ctx, *, query):
-    """Play a song from YouTube or Spotify via Lavalink"""
+    """Play a song. Accepts plain text searches, YouTube URLs, SoundCloud URLs,
+    Spotify track/album/playlist URLs (resolved by LavaSrc), and more."""
     player, error = await connect_voice(ctx)
     if error:
         await ctx.send(error)
@@ -364,54 +295,22 @@ async def play(ctx, *, query):
 
     await ctx.send(f"🔍 Searching for: {query}...")
 
-    if "spotify.com" in query:
-        resolved = await resolve_spotify_tracks(query)
-
-        if resolved == "AUTH_REQUIRED":
-            await ctx.send(
-                "❌ Spotify blocked this one — likely private or algorithmic. Try a public playlist or individual track URLs."
-            )
-            return
-
-        if not resolved:
-            await ctx.send("❌ Couldn't resolve that Spotify link!")
-            return
-
-        added = 0
-        for search_query, artist in resolved:
-            try:
-                result: wavelink.Search = await search_playable(search_query)
-            except Exception as e:
-                logger.error(f"Lavalink search error for '{search_query}': {e}")
-                continue
-            if not result:
-                continue
-            track = result.tracks[0] if isinstance(result, wavelink.Playlist) else result[0]
-            if not track:
-                continue
-            track.extras = {"requester": ctx.author.mention, "spotify_artist": artist, "is_fallback": False}
-            await player.queue.put_wait(track)
-            added += 1
-
-        if added == 0:
-            await ctx.send("❌ Couldn't find playable matches for that Spotify link!")
-            return
-
-        await ctx.send(f"✅ Added {added} track(s) from Spotify to queue")
-
-        if not player.playing:
-            await player.play(player.queue.get())
-        return
-
     try:
         result: wavelink.Search = await search_playable(query)
     except Exception as e:
-        logger.error(f"Lavalink search error: {e}")
+        logger.error(f"Lavalink search error for '{query}': {e}")
         await ctx.send("❌ Search failed — the Lavalink node may not have a working source plugin.")
         return
 
     if not result:
-        await ctx.send("❌ No results found!")
+        # Give a more specific hint if the user tried a Spotify link
+        if "spotify.com" in query:
+            await ctx.send(
+                "❌ Couldn't resolve that Spotify link. Make sure `SPOTIFY_CLIENT_ID` and "
+                "`SPOTIFY_CLIENT_SECRET` are set on the **Lavalink** service and that LavaSrc is loaded."
+            )
+        else:
+            await ctx.send("❌ No results found!")
         return
 
     if isinstance(result, wavelink.Playlist):
@@ -521,9 +420,6 @@ async def now_playing(ctx):
     requester = getattr(track.extras, "requester", None) if track.extras else None
     if requester:
         embed.add_field(name="📝 Requested By", value=requester, inline=True)
-    spotify_artist = getattr(track.extras, "spotify_artist", None) if track.extras else None
-    if spotify_artist:
-        embed.add_field(name="🎵 Spotify Artist", value=spotify_artist, inline=True)
     if player.queue.mode == wavelink.QueueMode.loop:
         embed.add_field(name="🔁 Loop", value="Enabled", inline=True)
     await ctx.send(embed=embed)
@@ -574,9 +470,6 @@ async def leave(ctx):
 
 
 # ==================== PER-GUILD CONFIG ====================
-# Kept for future per-guild settings (currently unused since AFK was removed),
-# but the file loader stays so we don't break existing guild_config.json files.
-
 GUILD_CONFIG_FILE = os.path.join(DATA_DIR, 'guild_config.json')
 
 
@@ -623,14 +516,7 @@ def save_live_data():
         logger.error(f"Failed to save live_links.json: {e}")
 
 
-# live_data = {
-#   "guild_channels": {"<guild_id>": <channel_id>},
-#   "guild_roles":    {"<guild_id>": <role_id>},
-#   "users":          {"<user_id>": {"tiktok": str|None, "kick": str|None}}
-# }
 live_data = load_live_data()
-
-# In-memory only — rebuilt every LIVE_CHECK_INTERVAL_SECONDS.
 live_status_cache: dict[str, dict] = {}
 
 
@@ -721,9 +607,6 @@ async def check_live_streams():
         if not tiktok_username and not kick_username:
             continue
 
-        # A linked user might share several servers with the bot — check
-        # once, then announce in every one of those servers that has a
-        # live-announce channel configured.
         member_guilds = [g for g in bot.guilds if g.get_member(int(user_id))]
         if not member_guilds:
             continue
@@ -1051,7 +934,6 @@ async def on_ready():
 
     await connect_lavalink()
 
-    # Initial presence sync across all guilds
     logger.info("🔄 Running initial member sync...")
     for guild in bot.guilds:
         for member in guild.members:
@@ -1150,7 +1032,7 @@ async def help_command(ctx):
         color=discord.Color.blue()
     )
     commands_list = {
-        "!play / !p": "Play a song from YouTube or Spotify",
+        "!play / !p": "Play a song (YouTube, Spotify, SoundCloud, or search)",
         "!skip": "Skip the current song",
         "!stop": "Stop playback and clear queue",
         "!pause": "Pause the current song",
@@ -1220,5 +1102,6 @@ if __name__ == "__main__":
     print("📡 Member tracking: Enabled (auto-sync every 5 minutes, all guilds)")
     print("✨ Avatar decorations: ENABLED (12h cache)")
     print(f"🔴 TikTok/Kick live tracking: Enabled (every {LIVE_CHECK_INTERVAL_SECONDS}s)")
+    print("🎵 Spotify: handled natively by LavaSrc via Lavalink")
     print("=" * 50)
     bot.run(TOKEN, reconnect=True)
