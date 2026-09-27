@@ -59,8 +59,22 @@ _decoration_cache: dict[int, tuple[str | None, float]] = {}
 _DECORATION_TTL = 60 * 60 * 12  # 12 hours
 
 
+def _build_decoration_url(asset: str) -> str:
+    """Build the full Discord CDN URL for an avatar decoration asset.
+
+    Animated decorations have assets prefixed with `a_` and must use `.gif`.
+    Static decorations use `.png`.
+    """
+    ext = "gif" if asset.startswith("a_") else "png"
+    return f"https://cdn.discordapp.com/avatar-decoration-presets/{asset}.{ext}?size=240"
+
+
 async def get_avatar_decoration(user_id: int) -> str | None:
-    """Return the decoration asset hash for a user, or None. Cached for 12h."""
+    """Return the FULL CDN URL for a user's avatar decoration, or None.
+
+    Returns None if the user has no decoration, if the fetch fails, or if the
+    API returns a non-200 status. Cached for 12h.
+    """
     now = time.time()
     cached = _decoration_cache.get(user_id)
     if cached and (now - cached[1]) < _DECORATION_TTL:
@@ -79,7 +93,10 @@ async def get_avatar_decoration(user_id: int) -> str | None:
                 deco = None
                 deco_data = data.get("avatar_decoration_data")
                 if deco_data and deco_data.get("asset"):
-                    deco = deco_data["asset"]
+                    deco = _build_decoration_url(deco_data["asset"])
+                    logger.info(f"✨ Decoration URL for {user_id}: {deco}")
+                else:
+                    logger.info(f"ℹ️ No decoration for {user_id}")
                 _decoration_cache[user_id] = (deco, now)
                 return deco
     except Exception as e:
@@ -247,7 +264,6 @@ async def on_wavelink_track_exception(payload: wavelink.TrackExceptionEventPaylo
                 except Exception as e:
                     logger.error(f"Failed to send failure notice: {e}")
     else:
-        # ---- CRITICAL FIX: log full error, send truncated version ----
         reason_raw = payload.exception.get("message", "Unknown error") if payload.exception else "Unknown error"
         logger.error(f"Playback failed for '{track.title}': {reason_raw}")
 
@@ -258,7 +274,6 @@ async def on_wavelink_track_exception(payload: wavelink.TrackExceptionEventPaylo
                     f"```{_safe_send_text(reason_raw)}```"
                 )
             except Exception as e:
-                # Never let error-reporting crash the bot
                 logger.error(f"Failed to send exception message: {e}")
 
     if not player.playing and not player.queue.is_empty:
@@ -913,7 +928,7 @@ async def update_member_presence(member):
             "username": member.name,
             "global_name": member.global_name,
             "avatar": str(member.avatar.url) if member.avatar else None,
-            "avatar_decoration": decoration,
+            "avatar_decoration": decoration,  # full CDN URL or None
             "status": status,
             "custom_status": custom_status,
             "activities": activities,
@@ -1135,7 +1150,7 @@ if __name__ == "__main__":
     print("=" * 50)
     print("🚀 Starting bot (Lavalink mode)...")
     print("📡 Member tracking: Enabled (auto-sync every 5 minutes, all guilds)")
-    print("✨ Avatar decorations: ENABLED (12h cache)")
+    print("✨ Avatar decorations: ENABLED (full CDN URL, 12h cache)")
     print(f"🔴 TikTok/Kick live tracking: Enabled (every {LIVE_CHECK_INTERVAL_SECONDS}s)")
     print("🎵 Spotify: handled natively by LavaSrc via Lavalink")
     print("=" * 50)
