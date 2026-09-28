@@ -55,20 +55,13 @@ class Player(wavelink.Player):
 
 
 # ==================== AVATAR DECORATION FETCH ====================
-# Cache stores (png_url_or_None, fetched_at)
 _decoration_cache: dict[int, tuple[str | None, float]] = {}
 _DECORATION_TTL = 60 * 60 * 12  # 12 hours
 
 
 def _build_decoration_url(asset: str) -> str:
-    """Build the FULL Discord CDN URL for an avatar decoration asset.
-
-    Discord's decoration asset hashes do NOT use the `a_` animated prefix
-    convention (that's for avatars/banners). We always serve the `.png`
-    variant of the decoration, regardless of whether it is animated.
-    """
+    """Build the FULL Discord CDN URL for an avatar decoration asset."""
     asset = str(asset).strip()
-    # Strip any extension the caller may have accidentally included.
     for ext in (".png", ".gif", ".webp"):
         if asset.lower().endswith(ext):
             asset = asset[: -len(ext)]
@@ -77,11 +70,7 @@ def _build_decoration_url(asset: str) -> str:
 
 
 async def get_avatar_decoration(user_id: int) -> str | None:
-    """Return the FULL CDN URL (.png) for a user's avatar decoration, or None.
-
-    Returns None if the user has no decoration, if the fetch fails, or if the
-    API returns a non-200 status. Cached for 12h.
-    """
+    """Return the FULL CDN URL (.png) for a user's avatar decoration, or None."""
     now = time.time()
     cached = _decoration_cache.get(user_id)
     if cached and (now - cached[1]) < _DECORATION_TTL:
@@ -101,9 +90,6 @@ async def get_avatar_decoration(user_id: int) -> str | None:
                 deco_data = data.get("avatar_decoration_data")
                 if deco_data and deco_data.get("asset"):
                     deco = _build_decoration_url(deco_data["asset"])
-                    logger.info(f"✨ Decoration URL for {user_id}: {deco}")
-                else:
-                    logger.info(f"ℹ️ No decoration for {user_id}")
                 _decoration_cache[user_id] = (deco, now)
                 return deco
     except Exception as e:
@@ -241,15 +227,16 @@ async def on_wavelink_track_exception(payload: wavelink.TrackExceptionEventPaylo
     if not player:
         return
 
-    already_fallback = getattr(track.extras, "is_fallback", False) if track.extras else False
+    # track.extras in wavelink 3.x is a plain dict, NOT an object with __dict__.
+    extras = track.extras if isinstance(track.extras, dict) else {}
+    already_fallback = bool(extras.get("is_fallback", False))
 
     if _is_youtube_track(track) and not already_fallback:
         logger.warning(f"YouTube playback failed for '{track.title}' — trying SoundCloud fallback.")
         fallback_track = await _search_fallback(track)
 
         if fallback_track:
-            old_extras = track.extras.__dict__ if track.extras else {}
-            fallback_track.extras = {**old_extras, "is_fallback": True}
+            fallback_track.extras = {**extras, "is_fallback": True}
             if player.home:
                 try:
                     await player.home.send(
@@ -555,15 +542,24 @@ def load_live_data():
     if os.path.exists(LIVE_LINKS_FILE):
         try:
             with open(LIVE_LINKS_FILE, 'r') as f:
-                return json.load(f)
+                data = json.load(f)
+                # Backfill shape in case the file predates these keys
+                data.setdefault("guild_channels", {})
+                data.setdefault("guild_roles", {})
+                data.setdefault("users", {})
+                data.setdefault("status", {})
+                return data
         except Exception as e:
             logger.error(f"Failed to load live_links.json: {e}")
-    return {"guild_channels": {}, "guild_roles": {}, "users": {}}
+    return {"guild_channels": {}, "guild_roles": {}, "users": {}, "status": {}}
 
 
 def save_live_data():
     try:
         os.makedirs(os.path.dirname(LIVE_LINKS_FILE) or '.', exist_ok=True)
+        # Persist live status too, so restarts don't re-announce people who
+        # were already live before the bot came back up.
+        live_data["status"] = live_status_cache
         with open(LIVE_LINKS_FILE, 'w') as f:
             json.dump(live_data, f, indent=2)
     except Exception as e:
@@ -571,7 +567,7 @@ def save_live_data():
 
 
 live_data = load_live_data()
-live_status_cache: dict[str, dict] = {}
+live_status_cache: dict[str, dict] = dict(live_data.get("status", {}))
 
 
 def get_all_live_users():
@@ -593,13 +589,19 @@ def get_all_live_users():
 
 
 async def check_tiktok_live(username: str) -> tuple[bool, str | None]:
-    """Best-effort TikTok live check via TikTokLive."""
+    """Best-effort TikTok live check via TikTokLive.
+
+    NOTE: TikTokLiveClient.is_live() is SYNCHRONOUS — do NOT await it.
+    Also, unique_id must NOT include the leading '@'.
+    """
     if not TIKTOK_AVAILABLE:
         return False, None
+    username = username.lstrip('@')
     try:
-        client = TikTokLiveClient(unique_id=f"@{username}")
-        is_live = await client.is_live()
-        return is_live, (f"https://www.tiktok.com/@{username}/live" if is_live else None)
+        client = TikTokLiveClient(unique_id=username)
+        # Run the blocking check in a thread so we don't stall the event loop
+        is_live = await asyncio.to_thread(client.is_live)
+        return bool(is_live), (f"https://www.tiktok.com/@{username}/live" if is_live else None)
     except Exception as e:
         logger.warning(f"TikTok live check failed for @{username}: {e}")
         return False, None
@@ -626,6 +628,8 @@ async def check_kick_live(username: str) -> tuple[bool, str | None, str | None]:
 
 async def announce_live(guild: discord.Guild, member: discord.Member, platform: str,
                          username: str, url: str | None, title: str | None = None):
+    if member is None:
+        return
     channel_id = live_data["guild_channels"].get(str(guild.id))
     if not channel_id:
         return
@@ -655,41 +659,56 @@ async def announce_live(guild: discord.Guild, member: discord.Member, platform: 
 
 @tasks.loop(seconds=LIVE_CHECK_INTERVAL_SECONDS)
 async def check_live_streams():
-    for user_id, links in list(live_data["users"].items()):
-        tiktok_username = links.get("tiktok")
-        kick_username = links.get("kick")
-        if not tiktok_username and not kick_username:
-            continue
+    try:
+        for user_id, links in list(live_data["users"].items()):
+            tiktok_username = links.get("tiktok")
+            kick_username = links.get("kick")
+            if not tiktok_username and not kick_username:
+                continue
 
-        member_guilds = [g for g in bot.guilds if g.get_member(int(user_id))]
-        if not member_guilds:
-            continue
+            member_guilds = []
+            for g in bot.guilds:
+                m = g.get_member(int(user_id))
+                if m:
+                    member_guilds.append((g, m))
+            if not member_guilds:
+                continue
 
-        prev = live_status_cache.get(user_id, {
-            "tiktok_live": False, "tiktok_url": None,
-            "kick_live": False, "kick_url": None, "kick_title": None
-        })
-        new_status = dict(prev)
+            prev = live_status_cache.get(user_id, {
+                "tiktok_live": False, "tiktok_url": None,
+                "kick_live": False, "kick_url": None, "kick_title": None
+            })
+            new_status = dict(prev)
 
-        if tiktok_username:
-            is_live, url = await check_tiktok_live(tiktok_username)
-            new_status["tiktok_live"] = is_live
-            new_status["tiktok_url"] = url
-            if is_live and not prev.get("tiktok_live"):
-                for g in member_guilds:
-                    await announce_live(g, g.get_member(int(user_id)), "TikTok", tiktok_username, url)
+            if tiktok_username:
+                try:
+                    is_live, url = await check_tiktok_live(tiktok_username)
+                    new_status["tiktok_live"] = is_live
+                    new_status["tiktok_url"] = url
+                    if is_live and not prev.get("tiktok_live"):
+                        for g, m in member_guilds:
+                            await announce_live(g, m, "TikTok", tiktok_username, url)
+                except Exception as e:
+                    logger.error(f"TikTok check crashed for {user_id}: {e}")
 
-        if kick_username:
-            is_live, url, title = await check_kick_live(kick_username)
-            new_status["kick_live"] = is_live
-            new_status["kick_url"] = url
-            new_status["kick_title"] = title
-            if is_live and not prev.get("kick_live"):
-                for g in member_guilds:
-                    await announce_live(g, g.get_member(int(user_id)), "Kick", kick_username, url, title)
+            if kick_username:
+                try:
+                    is_live, url, title = await check_kick_live(kick_username)
+                    new_status["kick_live"] = is_live
+                    new_status["kick_url"] = url
+                    new_status["kick_title"] = title
+                    if is_live and not prev.get("kick_live"):
+                        for g, m in member_guilds:
+                            await announce_live(g, m, "Kick", kick_username, url, title)
+                except Exception as e:
+                    logger.error(f"Kick check crashed for {user_id}: {e}")
 
-        live_status_cache[user_id] = new_status
-        await asyncio.sleep(1)
+            live_status_cache[user_id] = new_status
+            await asyncio.sleep(1)
+
+        save_live_data()
+    except Exception as e:
+        logger.error(f"check_live_streams loop crashed: {e}")
 
 
 @bot.command(name="linktiktok")
@@ -935,7 +954,7 @@ async def update_member_presence(member):
             "username": member.name,
             "global_name": member.global_name,
             "avatar": str(member.avatar.url) if member.avatar else None,
-            "avatar_decoration": decoration,  # full CDN URL (.png) or None
+            "avatar_decoration": decoration,
             "status": status,
             "custom_status": custom_status,
             "activities": activities,
@@ -1042,7 +1061,13 @@ async def stats(ctx):
     embed.add_field(name="🟢 Online Now", value=str(online), inline=True)
     embed.add_field(name="🎙️ In Voice", value=str(voice_members), inline=True)
     embed.add_field(name="🌐 Servers", value=str(len(bot.guilds)), inline=True)
-    total_queued = sum(len(p.queue) for p in wavelink.Pool.get_node().players.values()) if wavelink.Pool.nodes else 0
+
+    # wavelink.Pool.get_node() raises if no node is connected — guard it.
+    try:
+        node = wavelink.Pool.get_node()
+        total_queued = sum(len(p.queue) for p in node.players.values()) if node else 0
+    except Exception:
+        total_queued = 0
     embed.add_field(name="🎵 Total Queued", value=str(total_queued), inline=True)
     embed.add_field(name="🔴 Currently Live", value=str(live_count), inline=True)
     embed.set_footer(text="Made with ❤️")
